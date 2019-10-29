@@ -4,7 +4,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Multiset;
 import com.google.inject.AbstractModule;
+import com.netflix.conductor.common.metadata.tasks.Task;
+import com.netflix.conductor.common.metadata.workflow.WorkflowDef;
+import com.netflix.conductor.common.run.Workflow;
 import com.netflix.conductor.common.utils.JsonMapperProvider;
 import com.netflix.conductor.core.events.queue.Message;
 import com.netflix.conductor.core.execution.TestConfiguration;
@@ -18,12 +22,15 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -40,12 +47,12 @@ import org.slf4j.LoggerFactory;
 
 public class PerformanceTest {
 
-    public static final int MSGS = 5000;
+    public static final int MSGS = 500;
     public static final int PRODUCER_BATCH = 10; // make sure MSGS % PRODUCER_BATCH == 0
     public static final int PRODUCERS = 4;
-    public static final int WORKERS = 4;
+    public static final int WORKERS = 8;
     public static final int OBSERVERS = 1;
-    public static final int OBSERVER_DELAY = 500;
+    public static final int OBSERVER_DELAY = 1000;
     public static final int UNACK_RUNNERS = 0;
     public static final int UNACK_DELAY = 500;
     public static final int WORKER_BATCH = 10;
@@ -220,8 +227,183 @@ public class PerformanceTest {
     }
 
     @Test
-    public void testExecDaoPerformance() {
-        E.createTasks()
+    public void testExecDaoPerformance() throws InterruptedException {
+        AtomicBoolean stop = new AtomicBoolean(false);
+        Stopwatch start = Stopwatch.createStarted();
+        BlockingDeque<Task> msgQueue = new LinkedBlockingDeque<>(1000);
+
+        // Consumers - workers
+        for (int i = 0; i < WORKERS; i++) {
+            THREADPOOL.submit(() -> {
+                while (!stop.get()) {
+                    List<Task> popped = new ArrayList<>();
+                    while (true) {
+                        try {
+                            Task poll;
+                            poll = msgQueue.poll(10, TimeUnit.MILLISECONDS);
+                            if (poll == null) {
+                                // poll timed out
+                                continue;
+                            }
+                            popped.add(poll);
+                            if (stop.get() || popped.size() == WORKER_BATCH) {
+                                break;
+                            }
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+
+                    logger.info("Popped {} messages", popped.size());
+                    logger.info("Popped {}", popped.stream().map(Task::getTaskId).collect(Collectors.toList()));
+
+                    // Polling
+                    popped.stream()
+                            .peek(task -> {
+                                task.setWorkerId("someWorker");
+                                task.setPollCount(task.getPollCount() + 1);
+                                task.setStartTime(System.currentTimeMillis());
+                            })
+                            .forEach(task -> {
+                                // should always be false
+                                boolean concurrentLimit = E.exceedsInProgressLimit(task);
+                                E.updateLastPoll(task.getTaskType(), "domain", task.getWorkerId());
+                                task.setStartTime(System.currentTimeMillis());
+                                E.updateTask(task);
+                                logger.info("Polled {}", task.getTaskId());
+
+                            });
+
+                    logger.info("Updated last poll");
+                    E.updateLastPoll("taskType", "domain", "someWorker");
+
+                    popped.forEach(task -> {
+                        String wfId = task.getWorkflowInstanceId();
+                        Workflow workflow = E.getWorkflow(wfId, true);
+                        E.getTask(task.getTaskId());
+
+                        task.setStatus(Task.Status.COMPLETED);
+                        task.setWorkerId("someWorker");
+                        task.setOutputData(Collections.singletonMap("a", "b"));
+                        E.updateTask(task);
+                        E.updateWorkflow(workflow);
+                        logger.info("Updated {}", task.getTaskId());
+                    });
+
+                }
+            });
+        }
+
+        Multiset<String> pushedTasks = HashMultiset.create();
+
+        // Producers
+        List<Future<?>> producers = Lists.newArrayList();
+        for (int i = 0; i < PRODUCERS; i++) {
+            Future<?> producer = THREADPOOL.submit(() -> {
+                // N messages
+                for (int j = 0; j < MSGS / PRODUCER_BATCH; j++) {
+                    List<Task> randomTasks = getRandomTasks(PRODUCER_BATCH);
+
+                    Workflow wf = getWorkflow(randomTasks);
+                    E.createWorkflow(wf);
+
+                    E.createTasks(randomTasks);
+                    randomTasks.forEach(t -> {
+                        try {
+                            boolean offer = false;
+                            while (!offer) {
+                                offer = msgQueue.offer(t, 10, TimeUnit.MILLISECONDS);
+                            }
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+                    logger.info("Pushed {} messages", PRODUCER_BATCH);
+                    List<String> collect = randomTasks.stream().map(Task::getTaskId).collect(Collectors.toList());
+                    synchronized (pushedTasks) {
+                        pushedTasks.addAll(collect);
+                    }
+                    logger.info("Pushed {}", collect);
+                }
+                logger.info("Pushed ALL");
+            });
+
+            producers.add(producer);
+        }
+
+        // Observers
+        for (int i = 0; i < OBSERVERS; i++) {
+            THREADPOOL.submit(() -> {
+                while (!stop.get()) {
+                    List<Task> size = E.getPendingTasksForTaskType("taskType");
+                    logger.info("Size   {} messages", size.size());
+
+                    try {
+                        Thread.sleep(OBSERVER_DELAY);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            });
+        }
+
+        long elapsed;
+        while (true) {
+            try {
+                Thread.sleep(COMPLETION_MONITOR_DELAY);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+
+            int size = E.getPendingTasksForTaskType("taskType").size();
+            logger.info("MONITOR SIZE : {}", size);
+
+            if (size == 0 && producers.stream().map(Future::isDone).reduce(true, (b1, b2) -> b1 && b2)) {
+                elapsed = start.elapsed(TimeUnit.MILLISECONDS);
+                stop.set(true);
+                break;
+            }
+        }
+
+        THREADPOOL.awaitTermination(10, TimeUnit.SECONDS);
+        THREADPOOL.shutdown();
+        logger.info("Finished in {} ms", elapsed);
+        logger.info("Throughput {} msgs/second", ((MSGS * PRODUCERS) / (elapsed * 1.0)) * 1000);
+        logger.info("Threads finished");
+
+        List<String> duplicates = pushedTasks.entrySet().stream()
+                .filter(stringEntry -> stringEntry.getCount() > 1)
+                .map(stringEntry -> stringEntry.getElement() + ": " + stringEntry.getCount())
+                .collect(Collectors.toList());
+
+        logger.error("Found duplicate pushes: " + duplicates);
+    }
+
+    private Workflow getWorkflow(List<Task> randomTasks) {
+        Workflow wf = new Workflow();
+        wf.setWorkflowId(randomTasks.get(0).getWorkflowInstanceId());
+        wf.setCorrelationId(wf.getWorkflowId());
+        wf.setTasks(randomTasks);
+        WorkflowDef workflowDefinition = new WorkflowDef();
+        workflowDefinition.setName("abcd");
+        wf.setWorkflowDefinition(workflowDefinition);
+        wf.setStartTime(System.currentTimeMillis());
+        return wf;
+    }
+
+    private List<Task> getRandomTasks(int i) {
+        String timestamp = Long.toString(System.nanoTime());
+        return IntStream.range(0, i).mapToObj(j -> {
+            String id = Thread.currentThread().getId() + "_" + timestamp + "_" + j;
+            Task task = new Task();
+            task.setTaskId(id);
+            task.setCorrelationId(Thread.currentThread().getId() + "_" + timestamp);
+            task.setTaskType("taskType");
+            task.setReferenceTaskName("refName" + j);
+            task.setWorkflowType("task_wf");
+            task.setWorkflowInstanceId(Thread.currentThread().getId() + "_" + timestamp);
+            return task;
+        }).collect(Collectors.toList());
     }
 
     private List<Message> getRandomMessages(int i) {

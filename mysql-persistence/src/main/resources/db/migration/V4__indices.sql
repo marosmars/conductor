@@ -1,0 +1,1 @@
+CREATE INDEX queue_message_index ON queue_message(queue_name,message_id);

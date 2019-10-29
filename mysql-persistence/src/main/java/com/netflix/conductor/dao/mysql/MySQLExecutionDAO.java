@@ -25,6 +25,7 @@ import com.netflix.conductor.core.execution.ApplicationException;
 import com.netflix.conductor.dao.ExecutionDAO;
 import com.netflix.conductor.metrics.Monitors;
 
+import java.sql.ResultSet;
 import java.util.Collections;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -64,7 +65,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
     public List<Task> getPendingTasksByWorkflow(String taskDefName, String workflowId) {
         // @formatter:off
         String GET_IN_PROGRESS_TASKS_FOR_WORKFLOW = "SELECT json_data FROM task_in_progress tip "
-                + "INNER JOIN task t ON t.task_id = tip.task_id " + "WHERE task_def_name = ? AND workflow_id = ?";
+                + "INNER JOIN task t ON t.task_id = tip.task_id " + "WHERE task_def_name = ? AND workflow_id = ? FOR SHARE";
         // @formatter:on
 
         return queryWithTransaction(GET_IN_PROGRESS_TASKS_FOR_WORKFLOW,
@@ -105,33 +106,38 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
     public List<Task> createTasks(List<Task> tasks) {
         List<Task> created = Lists.newArrayListWithCapacity(tasks.size());
 
-        String ids = tasks.stream().map(Task::getTaskId).collect(Collectors.joining( "," ));
-        Optional<String> wfId = tasks.stream().findFirst().map(Task::getWorkflowInstanceId);
-        withTransaction(connection -> {
 
-            // Lock everything first
-            String LOCK_TASKS = "SELECT * FROM task WHERE task_id IN (?) FOR UPDATE";
-            execute(connection, LOCK_TASKS, q -> q.addParameter(ids).executeQuery());
-            String LOCK_TASKS_IN_PROG = "SELECT * FROM task_in_progress WHERE workflow_id = ? AND task_id IN (?) FOR UPDATE";
-            execute(connection, LOCK_TASKS_IN_PROG, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
-            String LOCK_WF_TO_TASKS = "SELECT * FROM workflow_to_task WHERE workflow_id = ? AND task_id IN (?) FOR UPDATE";
-            execute(connection, LOCK_WF_TO_TASKS, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
-            String LOCK_TASKS_SCHEDULED = "SELECT * FROM task_scheduled WHERE workflow_id = ? AND task_id IN (?) FOR UPDATE";
-            execute(connection, LOCK_TASKS_SCHEDULED, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
+        // Lock everything first
+//            String ids = tasks.stream().map(Task::getTaskId).collect(Collectors.joining( "," ));
+//            String keys = tasks.stream().map(MySQLExecutionDAO::taskKey).collect(Collectors.joining( "," ));
+//            logger.warn("Creating tasks {}", ids);
+//            Optional<String> wfId = tasks.stream().findFirst().map(Task::getWorkflowInstanceId);
+//
+//            logger.warn("Locking tasks");
+//            String LOCK_TASKS = "SELECT * FROM task WHERE task_id IN (?) FOR UPDATE";
+//            execute(connection, LOCK_TASKS, q -> q.addParameter(ids).executeQuery());
+//            logger.warn("Locking task_in_progress");
+//            String LOCK_TASKS_IN_PROG = "SELECT * FROM task_in_progress WHERE workflow_id = ? AND task_id IN (?) FOR UPDATE";
+//            execute(connection, LOCK_TASKS_IN_PROG, q -> q.addParameter(wfId.get()).addParameter(ids).executeQuery());
+//            logger.warn("Locking workflow_to_task");
+//            String LOCK_WF_TO_TASKS = "SELECT * FROM workflow_to_task WHERE workflow_id = ? AND task_id IN (?) FOR UPDATE";
+//            execute(connection, LOCK_WF_TO_TASKS, q -> q.addParameter(wfId.get()).addParameter(ids).executeQuery());
+//            logger.warn("Locking task_scheduled");
+//            String LOCK_TASKS_SCHEDULED = "SELECT * FROM task_scheduled WHERE task_key IN (?) FOR UPDATE";
+//            execute(connection, LOCK_TASKS_SCHEDULED, q -> q.addParameter(keys).executeQuery());
 
-            for (Task task : tasks) {
+        for (Task task : tasks) {
+            final String taskKey = taskKey(task);
+            withTransaction(connection -> {
                 validate(task);
 
                 task.setScheduledTime(System.currentTimeMillis());
-
-                final String taskKey = taskKey(task);
-
                 boolean scheduledTaskAdded = addScheduledTask(connection, task, taskKey);
 
                 if (!scheduledTaskAdded) {
                     logger.trace("Task already scheduled, skipping the run " + task.getTaskId() + ", ref="
                             + task.getReferenceTaskName() + ", key=" + taskKey);
-                    continue;
+                    return;
                 }
 
                 insertOrUpdateTaskData(connection, task);
@@ -140,8 +146,8 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
                 updateTask(connection, task);
 
                 created.add(task);
-            }
-        });
+            });
+        }
 
         return created;
     }
@@ -156,14 +162,14 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
             String LOCK_TASKS = "SELECT * FROM task WHERE task_id = ? FOR UPDATE";
             execute(connection, LOCK_TASKS, q -> q.addParameter(ids).executeQuery());
 
+            String LOCK_WF_TO_TASKS = "SELECT * FROM workflow_to_task WHERE workflow_id = ? AND task_id = ? FOR UPDATE";
+            execute(connection, LOCK_WF_TO_TASKS, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
+
             if ((task.getTaskDefinition().isPresent() && task.getTaskDefinition().get().concurrencyLimit() > 0) ||
                     (task.getStatus() != null && task.getStatus().isTerminal())) {
                 String LOCK_TASKS_IN_PROG = "SELECT * FROM task_in_progress WHERE workflow_id = ? AND task_id = ? FOR UPDATE";
                 execute(connection, LOCK_TASKS_IN_PROG, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
             }
-
-            String LOCK_WF_TO_TASKS = "SELECT * FROM workflow_to_task WHERE workflow_id = ? AND task_id = ? FOR UPDATE";
-            execute(connection, LOCK_WF_TO_TASKS, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
 
             updateTask(connection, task);
         });
@@ -243,7 +249,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
 
     @Override
     public Task getTask(String taskId) {
-        String GET_TASK = "SELECT json_data FROM task WHERE task_id = ?";
+        String GET_TASK = "SELECT json_data FROM task WHERE task_id = ? FOR SHARE";
         return queryWithTransaction(GET_TASK, q -> q.addParameter(taskId).executeAndFetchFirst(Task.class));
     }
 
@@ -260,7 +266,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
         Preconditions.checkNotNull(taskName, "task name cannot be null");
         // @formatter:off
         String GET_IN_PROGRESS_TASKS_FOR_TYPE = "SELECT json_data FROM task_in_progress tip "
-                + "INNER JOIN task t ON t.task_id = tip.task_id " + "WHERE task_def_name = ?";
+                + "INNER JOIN task t ON t.task_id = tip.task_id " + "WHERE task_def_name = ? FOR SHARE SKIP LOCKED";
         // @formatter:on
 
         return queryWithTransaction(GET_IN_PROGRESS_TASKS_FOR_TYPE,
@@ -269,7 +275,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
 
     @Override
     public List<Task> getTasksForWorkflow(String workflowId) {
-        String GET_TASKS_FOR_WORKFLOW = "SELECT task_id FROM workflow_to_task WHERE workflow_id = ?";
+        String GET_TASKS_FOR_WORKFLOW = "SELECT task_id FROM workflow_to_task WHERE workflow_id = ? FOR SHARE";
         return getWithRetriedTransactions(tx -> query(tx, GET_TASKS_FOR_WORKFLOW, q -> {
             List<String> taskIds = q.addParameter(workflowId).executeScalarList(String.class);
             return getTasks(tx, taskIds);
@@ -333,7 +339,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
 
     /**
      * @param workflowName name of the workflow
-     * @param version the workflow version
+     * @param version      the workflow version
      * @return list of workflow ids that are in RUNNING state
      * <em>returns workflows of all versions for the given workflow name</em>
      */
@@ -348,7 +354,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
 
     /**
      * @param workflowName Name of the workflow
-     * @param version the workflow version
+     * @param version      the workflow version
      * @return list of workflows that are in RUNNING state
      */
     @Override
@@ -370,7 +376,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
 
     @Override
     public long getInProgressTaskCount(String taskDefName) {
-        String GET_IN_PROGRESS_TASK_COUNT = "SELECT COUNT(*) FROM task_in_progress WHERE task_def_name = ? AND in_progress_status = true";
+        String GET_IN_PROGRESS_TASK_COUNT = "SELECT COUNT(*) FROM task_in_progress WHERE task_def_name = ? AND in_progress_status = true FOR SHARE SKIP LOCKED";
 
         return queryWithTransaction(GET_IN_PROGRESS_TASK_COUNT, q -> q.addParameter(taskDefName).executeCount());
     }
@@ -386,7 +392,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
         withTransaction(tx -> {
             // @formatter:off
             String GET_ALL_WORKFLOWS_FOR_WORKFLOW_DEF = "SELECT workflow_id FROM workflow_def_to_workflow "
-                    + "WHERE workflow_def = ? AND date_str BETWEEN ? AND ?";
+                    + "WHERE workflow_def = ? AND date_str BETWEEN ? AND ? FOR SHARE";
             // @formatter:on
 
             List<String> workflowIds = query(tx, GET_ALL_WORKFLOWS_FOR_WORKFLOW_DEF, q -> q.addParameter(workflowName)
@@ -409,7 +415,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
     @Override
     public List<Workflow> getWorkflowsByCorrelationId(String correlationId, boolean includeTasks) {
         Preconditions.checkNotNull(correlationId, "correlationId cannot be null");
-        String GET_WORKFLOWS_BY_CORRELATION_ID = "SELECT workflow_id FROM workflow WHERE correlation_id = ?";
+        String GET_WORKFLOWS_BY_CORRELATION_ID = "SELECT workflow_id FROM workflow WHERE correlation_id = ? FOR SHARE";
 
         return queryWithTransaction(GET_WORKFLOWS_BY_CORRELATION_ID,
                 q -> q.addParameter(correlationId).executeScalarList(String.class).stream()
@@ -505,7 +511,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
         // Generate a formatted query string with a variable number of bind params based
         // on taskIds.size()
         final String GET_TASKS_FOR_IDS = String.format(
-                "SELECT json_data FROM task WHERE task_id IN (%s) AND json_data IS NOT NULL",
+                "SELECT json_data FROM task WHERE task_id IN (%s) AND json_data IS NOT NULL FOR SHARE",
                 Query.generateInBindings(taskIds.size()));
 
         return query(connection, GET_TASKS_FOR_IDS, q -> q.addParameters(taskIds).executeAndFetch(Task.class));
@@ -542,8 +548,8 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
         Optional<TaskDef> taskDefinition = task.getTaskDefinition();
 
         insertOrUpdateTaskData(connection, task);
-        
-	if (taskDefinition.isPresent() && taskDefinition.get().concurrencyLimit() > 0) {
+
+        if (taskDefinition.isPresent() && taskDefinition.get().concurrencyLimit() > 0) {
             boolean inProgress = task.getStatus() != null && task.getStatus().equals(Task.Status.IN_PROGRESS);
             updateInProgressStatus(connection, task, inProgress);
         }
@@ -643,6 +649,11 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
 
     @VisibleForTesting
     boolean addScheduledTask(Connection connection, Task task, String taskKey) {
+        String LOCK_TASKS_SCHEDULED = "SELECT EXISTS(SELECT 1 FROM task_scheduled WHERE workflow_id = ? AND task_key = ? AND task_id = ? FOR SHARE)";
+        boolean exists = query(connection, LOCK_TASKS_SCHEDULED, q -> q.addParameter(task.getWorkflowInstanceId()).addParameter(taskKey).addParameter(task.getTaskId()).exists());
+        if (exists) {
+            return true;
+        }
 
         final String INSERT_IGNORE_SCHEDULED_TASK = "INSERT IGNORE INTO task_scheduled (workflow_id, task_key, task_id) VALUES (?, ?, ?)";
 
@@ -659,7 +670,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
     }
 
     private void addTaskInProgress(Connection connection, Task task) {
-        String EXISTS_IN_PROGRESS_TASK = "SELECT EXISTS(SELECT 1 FROM task_in_progress WHERE task_def_name = ? AND task_id = ?)";
+        String EXISTS_IN_PROGRESS_TASK = "SELECT EXISTS(SELECT 1 FROM task_in_progress WHERE task_def_name = ? AND task_id = ?) FOR UPDATE";
 
         boolean exist = query(connection, EXISTS_IN_PROGRESS_TASK,
                 q -> q.addParameter(task.getTaskDefName()).addParameter(task.getTaskId()).exists());
@@ -750,7 +761,7 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
     }
 
     private List<String> findAllTasksInProgressInOrderOfArrival(Task task, int limit) {
-        String GET_IN_PROGRESS_TASKS_WITH_LIMIT = "SELECT task_id FROM task_in_progress WHERE task_def_name = ? ORDER BY id LIMIT ?";
+        String GET_IN_PROGRESS_TASKS_WITH_LIMIT = "SELECT task_id FROM task_in_progress WHERE task_def_name = ? ORDER BY id LIMIT ? FOR SHARE";
 
         return queryWithTransaction(GET_IN_PROGRESS_TASKS_WITH_LIMIT,
                 q -> q.addParameter(task.getTaskDefName()).addParameter(limit).executeScalarList(String.class));

@@ -3,7 +3,7 @@ FROM openjdk:8-jdk AS base
 COPY ./ /conductor
 
 # Download and build .jar files needed
-RUN cd conductor/server && ../gradlew build --no-daemon -x test
+RUN cd conductor/server
 
 #
 # conductor:server - Netflix conductor server

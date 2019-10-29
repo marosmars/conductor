@@ -99,7 +99,7 @@ public class RetryUtil<T> {
                 .retryIfResult(Optional.ofNullable(resultRetryPredicate).orElse(result -> false))
                 .withWaitStrategy(WaitStrategies.join(
                         WaitStrategies.exponentialWait(1000, 90, TimeUnit.SECONDS),
-                        WaitStrategies.randomWait(100, TimeUnit.MILLISECONDS, 500, TimeUnit.MILLISECONDS)
+                        WaitStrategies.randomWait(0, TimeUnit.MILLISECONDS, 250, TimeUnit.MILLISECONDS)
                 ))
                 .withStopStrategy(StopStrategies.stopAfterAttempt(retryCount))
                 .withBlockStrategy(BlockStrategies.threadSleepStrategy())
@@ -108,6 +108,10 @@ public class RetryUtil<T> {
                     public <V> void onRetry(Attempt<V> attempt) {
                         logger.debug("Attempt # {}, {} millis since first attempt. Operation: {}, description:{}",
                                 attempt.getAttemptNumber(), attempt.getDelaySinceFirstAttempt(), operationName, shortDescription);
+                        if (attempt.getAttemptNumber() > 1) {
+                            logger.warn("Attempt # {}, {} millis since first attempt. Operation: {}, description:{}",
+                                    attempt.getAttemptNumber(), attempt.getDelaySinceFirstAttempt(), operationName, shortDescription);
+                        }
                         internalNumberOfRetries.incrementAndGet();
                     }
                 })

@@ -79,7 +79,6 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
             return messages;
         }
 
-
         long start = System.currentTimeMillis();
         final List<Message> messages = new ArrayList<>();
 
@@ -107,7 +106,7 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
     @Override
     public int getSize(String queueName) {
         return getWithRetriedTransactions(tx -> {
-            String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR SHARE";
+            String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR SHARE SKIP LOCKED";
             execute(tx, LOCK_TASKS, q -> q.addParameter(queueName).executeQuery());
 
             final String GET_QUEUE_SIZE = "SELECT COUNT(*) FROM queue_message WHERE queue_name = ?";
@@ -139,7 +138,7 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
 
     @Override
     public Map<String, Long> queuesDetail() {
-        final String GET_QUEUES_DETAIL = "SELECT queue_name, (SELECT count(*) FROM queue_message WHERE popped = false AND queue_name = q.queue_name) AS size FROM queue q";
+        final String GET_QUEUES_DETAIL = "SELECT queue_name, (SELECT count(*) FROM queue_message WHERE popped = false AND queue_name = q.queue_name) AS size FROM queue q FOR SHARE SKIP LOCKED";
         return queryWithTransaction(GET_QUEUES_DETAIL, q -> q.executeAndFetch(rs -> {
             Map<String, Long> detail = Maps.newHashMap();
             while (rs.next()) {
@@ -157,7 +156,7 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
         final String GET_QUEUES_DETAIL_VERBOSE = "SELECT queue_name, \n"
                 + "       (SELECT count(*) FROM queue_message WHERE popped = false AND queue_name = q.queue_name) AS size,\n"
                 + "       (SELECT count(*) FROM queue_message WHERE popped = true AND queue_name = q.queue_name) AS uacked \n"
-                + "FROM queue q";
+                + "FROM queue q FOR SHARE SKIP LOCKED";
         // @formatter:on
 
         return queryWithTransaction(GET_QUEUES_DETAIL_VERBOSE, q -> q.executeAndFetch(rs -> {
@@ -334,8 +333,11 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
 
     private void createQueueIfNotExists(Connection connection, String queueName) {
         logger.trace("Creating new queue '{}'", queueName);
-
-        final String CREATE_QUEUE = "INSERT IGNORE INTO queue (queue_name) VALUES (?)";
-        execute(connection, CREATE_QUEUE, q -> q.addParameter(queueName).executeUpdate());
+        final String EXISTS_MESSAGE = "SELECT EXISTS(SELECT 1 FROM queue WHERE queue_name = ?) FOR SHARE";
+        Boolean query = query(connection, EXISTS_MESSAGE, q -> q.addParameter(queueName).exists());
+        if (!query) {
+            final String CREATE_QUEUE = "INSERT INTO queue (queue_name) VALUES (?)";
+            execute(connection, CREATE_QUEUE, q -> q.addParameter(queueName).executeUpdate());
+        }
     }
 }

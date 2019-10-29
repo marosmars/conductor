@@ -31,7 +31,7 @@ import static java.lang.System.getProperty;
 
 public abstract class MySQLBaseDAO {
     private static final String MAX_RETRY_ON_DEADLOCK_PROPERTY_NAME = "conductor.mysql.deadlock.retry.max";
-    private static final String MAX_RETRY_ON_DEADLOCK_PROPERTY_DEFAULT_VALUE = "3";
+    private static final String MAX_RETRY_ON_DEADLOCK_PROPERTY_DEFAULT_VALUE = "10";
     private static final int MAX_RETRY_ON_DEADLOCK = getMaxRetriesOnDeadLock();
     private static final List<String> EXCLUDED_STACKTRACE_CLASS = ImmutableList.of(
             MySQLBaseDAO.class.getName(),
@@ -111,7 +111,7 @@ public abstract class MySQLBaseDAO {
                 return result;
             } catch (Throwable th) {
                 tx.rollback();
-                throw new ApplicationException(BACKEND_ERROR, th.getMessage(), th);
+                throw new ApplicationException(BACKEND_ERROR, tx + " " + th.getMessage(), th);
             } finally {
                 tx.setAutoCommit(previousAutoCommitMode);
             }
@@ -130,6 +130,21 @@ public abstract class MySQLBaseDAO {
                     null,
                     MAX_RETRY_ON_DEADLOCK,
                     "retry on deadlock",
+                    "transactional"
+            );
+        } catch (RuntimeException e){
+            throw (ApplicationException)e.getCause();
+        }
+    }
+
+    <R> R getWithRetriedTransactions(final TransactionalFunction<R> function, String description) {
+        try {
+            return new RetryUtil<R>().retryOnException(
+                    () -> getWithTransaction(function),
+                    this::isDeadLockError,
+                    null,
+                    MAX_RETRY_ON_DEADLOCK,
+                    "retry on deadlock " + description,
                     "transactional"
             );
         } catch (RuntimeException e){

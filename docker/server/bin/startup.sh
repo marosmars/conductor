@@ -30,4 +30,4 @@ if [ -z "$LOG4J_PROP" ];
     export log4j_file=/app/config/$LOG4J_PROP
 fi
 
-java -jar conductor-server-*-all.jar $config_file $log4j_file
+java -agentlib:hprof=cpu=samples -jar conductor-server-*-all.jar $config_file $log4j_file

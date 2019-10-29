@@ -170,3 +170,4 @@ CREATE TABLE queue_message (
   UNIQUE KEY unique_queue_name_message_id (queue_name,message_id),
   KEY combo_queue_message (queue_name,popped,deliver_on,created_on)
 );
+
