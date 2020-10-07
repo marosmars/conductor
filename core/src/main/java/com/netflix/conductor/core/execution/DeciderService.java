@@ -475,7 +475,8 @@ public class DeciderService {
             return;
         }
 
-        String reason = "Task timed out after " + elapsedTime + " millisecond.  Timeout configured as " + timeout;
+        String reason = "Task timed out after " + elapsedTime + " millisecond.  Timeout configured as " + timeout +
+                " for task: " + task.getTaskId() + " of type " + task.getTaskType();
         Monitors.recordTaskTimeout(task.getTaskDefName());
 
         switch (taskDef.getTimeoutPolicy()) {

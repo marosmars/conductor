@@ -159,24 +159,40 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
 
         logger.trace("processAllUnacks started");
 
+        getWithRetriedTransactions(tx -> {
+            String LOCK_TASKS = "SELECT * FROM queue_message FOR UPDATE";
+            execute(tx, LOCK_TASKS, Query::executeQuery);
 
-        final String PROCESS_ALL_UNACKS = "UPDATE queue_message SET popped = false WHERE popped = true AND TIMESTAMPADD(SECOND,60,CURRENT_TIMESTAMP) > deliver_on";
-        executeWithTransaction(PROCESS_ALL_UNACKS, Query::executeUpdate);
+            final String PROCESS_ALL_UNACKS = "UPDATE queue_message SET popped = false WHERE popped = true AND TIMESTAMPADD(SECOND,60,CURRENT_TIMESTAMP) > deliver_on";
+            execute(tx, PROCESS_ALL_UNACKS, Query::executeUpdate);
+            return null;
+        });
     }
 
     @Override
     public void processUnacks(String queueName) {
-        final String PROCESS_UNACKS = "UPDATE queue_message SET popped = false WHERE queue_name = ? AND popped = true AND TIMESTAMPADD(SECOND,60,CURRENT_TIMESTAMP)  > deliver_on";
-        executeWithTransaction(PROCESS_UNACKS, q -> q.addParameter(queueName).executeUpdate());
+        getWithRetriedTransactions(tx -> {
+            String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR UPDATE";
+            execute(tx, LOCK_TASKS, q -> q.addParameter(queueName).executeQuery());
+
+            final String PROCESS_UNACKS = "UPDATE queue_message SET popped = false WHERE queue_name = ? AND popped = true AND TIMESTAMPADD(SECOND,60,CURRENT_TIMESTAMP)  > deliver_on";
+            execute(tx, PROCESS_UNACKS, q -> q.addParameter(queueName).executeUpdate());
+            return null;
+        });
     }
 
     @Override
     public boolean setOffsetTime(String queueName, String messageId, long offsetTimeInSecond) {
-        final String SET_OFFSET_TIME = "UPDATE queue_message SET offset_time_seconds = ?, deliver_on = TIMESTAMPADD(SECOND,?,CURRENT_TIMESTAMP) \n"
-                + "WHERE queue_name = ? AND message_id = ?";
+        return getWithRetriedTransactions(tx -> {
+            String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR UPDATE";
+            execute(tx, LOCK_TASKS, q -> q.addParameter(queueName).executeQuery());
 
-        return queryWithTransaction(SET_OFFSET_TIME, q -> q.addParameter(offsetTimeInSecond)
-                .addParameter(offsetTimeInSecond).addParameter(queueName).addParameter(messageId).executeUpdate() == 1);
+            final String SET_OFFSET_TIME = "UPDATE queue_message SET offset_time_seconds = ?, deliver_on = TIMESTAMPADD(SECOND,?,CURRENT_TIMESTAMP) \n"
+                    + "WHERE queue_name = ? AND message_id = ?";
+
+            return query(tx, SET_OFFSET_TIME, q -> q.addParameter(offsetTimeInSecond)
+                    .addParameter(offsetTimeInSecond).addParameter(queueName).addParameter(messageId).executeUpdate()) == 1;
+        });
     }
 
     @Override
@@ -185,12 +201,17 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
     }
 
     private boolean existsMessage(Connection connection, String queueName, String messageId) {
+        String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR UPDATE";
+        execute(connection, LOCK_TASKS, q -> q.addParameter(queueName).executeQuery());
+
         final String EXISTS_MESSAGE = "SELECT EXISTS(SELECT 1 FROM queue_message WHERE queue_name = ? AND message_id = ?)";
         return query(connection, EXISTS_MESSAGE, q -> q.addParameter(queueName).addParameter(messageId).exists());
     }
 
     private void pushMessage(Connection connection, String queueName, String messageId, String payload, Integer priority,
                              long offsetTimeInSecond) {
+        String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR UPDATE";
+        execute(connection, LOCK_TASKS, q -> q.addParameter(queueName).executeQuery());
 
         String PUSH_MESSAGE = "INSERT INTO queue_message (deliver_on, queue_name, message_id, priority, offset_time_seconds, payload) VALUES (TIMESTAMPADD(SECOND,?,CURRENT_TIMESTAMP), ?, ?,?,?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload), deliver_on=VALUES(deliver_on)";
 
@@ -202,6 +223,9 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
     }
 
     private boolean removeMessage(Connection connection, String queueName, String messageId) {
+        String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR UPDATE";
+        execute(connection, LOCK_TASKS, q -> q.addParameter(queueName).executeQuery());
+
         final String REMOVE_MESSAGE = "DELETE FROM queue_message WHERE queue_name = ? AND message_id = ?";
         return query(connection, REMOVE_MESSAGE,
                 q -> q.addParameter(queueName).addParameter(messageId).executeDelete());
@@ -210,6 +234,9 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
     private List<Message> peekMessages(Connection connection, String queueName, int count) {
         if (count < 1)
             return Collections.emptyList();
+
+        String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR UPDATE";
+        execute(connection, LOCK_TASKS, q -> q.addParameter(queueName).executeQuery());
 
         final String PEEK_MESSAGES = "SELECT message_id, priority, payload FROM queue_message use index(combo_queue_message) WHERE queue_name = ? AND popped = false AND deliver_on <= TIMESTAMPADD(MICROSECOND, 1000, CURRENT_TIMESTAMP) ORDER BY priority DESC, deliver_on, created_on LIMIT ?";
 
@@ -230,6 +257,9 @@ public class MySQLQueueDAO extends MySQLBaseDAO implements QueueDAO {
     }
 
     private List<Message> popMessages(Connection connection, String queueName, int count, int timeout) {
+        String LOCK_TASKS = "SELECT * FROM queue_message WHERE queue_name = ? FOR UPDATE";
+        execute(connection, LOCK_TASKS, q -> q.addParameter(queueName).executeQuery());
+
         long start = System.currentTimeMillis();
         List<Message> messages = peekMessages(connection, queueName, count);
 
