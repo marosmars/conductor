@@ -25,6 +25,7 @@ import com.netflix.conductor.core.execution.ApplicationException;
 import com.netflix.conductor.dao.ExecutionDAO;
 import com.netflix.conductor.metrics.Monitors;
 
+import java.util.Collections;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.sql.DataSource;
@@ -104,7 +105,21 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
     public List<Task> createTasks(List<Task> tasks) {
         List<Task> created = Lists.newArrayListWithCapacity(tasks.size());
 
+        String ids = tasks.stream().map(Task::getTaskId).collect(Collectors.joining( "," ));
+        Optional<String> wfId = tasks.stream().findFirst().map(Task::getWorkflowInstanceId);
         withTransaction(connection -> {
+
+            // Lock everything first
+            logger.info("LOCKING FROM CREATE TASKS");
+            String LOCK_TASKS = "SELECT * FROM task WHERE task_id IN (?) FOR UPDATE";
+            execute(connection, LOCK_TASKS, q -> q.addParameter(ids).executeQuery());
+            String LOCK_TASKS_IN_PROG = "SELECT * FROM task_in_progress WHERE workflow_id = ? AND task_id IN (?) FOR UPDATE";
+            execute(connection, LOCK_TASKS_IN_PROG, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
+            String LOCK_WF_TO_TASKS = "SELECT * FROM workflow_to_task WHERE workflow_id = ? AND task_id IN (?) FOR UPDATE";
+            execute(connection, LOCK_WF_TO_TASKS, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
+            String LOCK_TASKS_SCHEDULED = "SELECT * FROM task_scheduled WHERE workflow_id = ? AND task_id IN (?) FOR UPDATE";
+            execute(connection, LOCK_TASKS_SCHEDULED, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
+
             for (Task task : tasks) {
                 validate(task);
 
@@ -134,7 +149,23 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
 
     @Override
     public void updateTask(Task task) {
-        withTransaction(connection -> updateTask(connection, task));
+        withTransaction(connection -> {
+
+            String ids = task.getTaskId();
+            Optional<String> wfId = Optional.of(task.getWorkflowInstanceId());
+
+            logger.info("LOCKING FROM UPDATE TASK");
+            String LOCK_TASKS = "SELECT * FROM task WHERE task_id = ? FOR UPDATE";
+            execute(connection, LOCK_TASKS, q -> q.addParameter(ids).executeQuery());
+            String LOCK_TASKS_IN_PROG = "SELECT * FROM task_in_progress WHERE workflow_id = ? AND task_id = ? FOR UPDATE";
+            execute(connection, LOCK_TASKS_IN_PROG, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
+            String LOCK_WF_TO_TASKS = "SELECT * FROM workflow_to_task WHERE workflow_id = ? AND task_id = ? FOR UPDATE";
+            execute(connection, LOCK_WF_TO_TASKS, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
+            String LOCK_TASKS_SCHEDULED = "SELECT * FROM task_scheduled WHERE workflow_id = ? AND task_id = ? FOR UPDATE";
+            execute(connection, LOCK_TASKS_SCHEDULED, q -> q.addParameter(wfId.orElse("")).addParameter(ids).executeQuery());
+
+            updateTask(connection, task);
+        });
     }
 
     /**
@@ -509,12 +540,13 @@ public class MySQLExecutionDAO extends MySQLBaseDAO implements ExecutionDAO {
     private void updateTask(Connection connection, Task task) {
         Optional<TaskDef> taskDefinition = task.getTaskDefinition();
 
-        if (taskDefinition.isPresent() && taskDefinition.get().concurrencyLimit() > 0) {
+        insertOrUpdateTaskData(connection, task);
+        
+	if (taskDefinition.isPresent() && taskDefinition.get().concurrencyLimit() > 0) {
             boolean inProgress = task.getStatus() != null && task.getStatus().equals(Task.Status.IN_PROGRESS);
             updateInProgressStatus(connection, task, inProgress);
         }
 
-        insertOrUpdateTaskData(connection, task);
 
         if (task.getStatus() != null && task.getStatus().isTerminal()) {
             removeTaskInProgress(connection, task);
