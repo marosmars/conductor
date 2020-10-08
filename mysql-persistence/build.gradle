@@ -7,6 +7,9 @@ dependencies {
     compile "com.zaxxer:HikariCP:${revHikariCP}"
     compile "org.flywaydb:flyway-core:${revFlywayCore}"
 
+    testCompile group: 'ch.qos.logback', name: 'logback-classic', version: '1.1.0'
+
+
     testCompile project(':conductor-core').sourceSets.test.output
     testCompile "ch.vorburger.mariaDB4j:mariaDB4j:${revMariaDB4j}"
 }
